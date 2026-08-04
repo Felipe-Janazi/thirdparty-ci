@@ -65,7 +65,7 @@ jobs:
   # (identico ao workflow completo - e o job que estamos testando)
   # ----------------------------------------------------------
   validate-dockerfile:
-    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout do repositorio que chamou o workflow
         uses: actions/checkout@v4
@@ -96,7 +96,7 @@ jobs:
   # ----------------------------------------------------------
   resolve-artifact:
     needs: validate-dockerfile
-    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    runs-on: ubuntu-latest
     outputs:
       source: ${{ steps.check.outputs.source }}
     steps:
@@ -151,7 +151,7 @@ jobs:
   # ----------------------------------------------------------
   build-only:
     needs: resolve-artifact
-    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
