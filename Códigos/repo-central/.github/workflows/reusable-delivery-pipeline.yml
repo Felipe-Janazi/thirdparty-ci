@@ -1,0 +1,204 @@
+# ============================================================
+# WORKFLOW REUTILIZAVEL - Pipeline de Entrega (Docker + Orca)
+# ============================================================
+# Este arquivo deve viver no REPOSITORIO PRINCIPAL de workflows
+# (o mesmo onde ja fica o b3-reusable-workflows).
+#
+# Ele NAO roda sozinho: e chamado por outros repositorios via
+# "workflow_call" (ver arquivo caller-delivery.yml de exemplo).
+#
+# Regras de negocio implementadas:
+#   1. Bloqueia o Dockerfile se houver comando de build (mvn, npm, etc)
+#   2. Artefato > max-size-mb -> deve vir do Nexus
+#      Artefato <= max-size-mb -> pode vir do proprio repositorio
+#   3. Build da imagem Docker (so empacota, nunca compila app)
+#   4. Scan de seguranca com Orca
+#   5. Publicacao da imagem (image.tar) como GitHub Release
+# ============================================================
+
+name: Reusable - Delivery Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      artifact-path:
+        description: "Caminho relativo do artefato dentro do repositorio (ex: artifacts/app.jar)"
+        required: false
+        type: string
+        default: "artifacts/app.jar"
+      nexus-artifact-url:
+        description: "URL completa do artefato no Nexus. Usada somente se o artefato nao existir no repo ou exceder o limite de tamanho"
+        required: false
+        type: string
+        default: ""
+      max-size-mb:
+        description: "Tamanho maximo (MB) permitido para o artefato quando entregue via repositorio"
+        required: false
+        type: number
+        default: 50
+      runner-label:
+        description: "Label adicional do runner self-hosted a ser utilizado"
+        required: false
+        type: string
+        default: "sncd-dev"
+      image-name:
+        description: "Nome da imagem Docker gerada"
+        required: false
+        type: string
+        default: "app"
+      orca-fail-on:
+        description: "Severidades que devem bloquear o pipeline no scan do Orca"
+        required: false
+        type: string
+        default: "critical,high"
+    secrets:
+      NEXUS_USER:
+        required: false
+      NEXUS_PASS:
+        required: false
+      ORCA_API_TOKEN:
+        required: true
+
+jobs:
+
+  # ----------------------------------------------------------
+  # JOB 1 - Valida que o Dockerfile NAO contem build de app
+  # ----------------------------------------------------------
+  validate-dockerfile:
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    steps:
+      - name: Checkout do repositorio que chamou o workflow
+        uses: actions/checkout@v4
+
+      - name: Verificar existencia do Dockerfile
+        run: |
+          if [ ! -f "Dockerfile" ]; then
+            echo "::error::Nenhum Dockerfile encontrado na raiz do repositorio."
+            exit 1
+          fi
+
+      - name: Bloquear Dockerfile com comandos de build de aplicacao
+        run: |
+          # Padroes que indicam BUILD de aplicacao (Java, Node, Go, .NET, Python, Make).
+          # Adicione novos padroes aqui conforme surgirem novas stacks.
+          PADROES_PROIBIDOS="mvn |maven |npm install|npm ci|npm run build|yarn install|yarn build|gradle |\.\/gradlew|go build|dotnet build|dotnet publish|pip install -e|make build"
+
+          echo "Analisando Dockerfile em busca de comandos de build..."
+
+          # grep -E (regex estendida) -i (ignora maiusculas/minusculas) -q (silencioso)
+          if grep -Eiq "$PADROES_PROIBIDOS" Dockerfile; then
+            echo "::error::Voce esta fazendo build de uma aplicacao. Utilize outro fluxo, esse fluxo e somente para entrega de arquivos / imagens de terceiro."
+            exit 1
+          fi
+
+          echo "OK: nenhum comando de build encontrado no Dockerfile."
+
+  # ----------------------------------------------------------
+  # JOB 2 - Resolve a origem do artefato (repo x Nexus)
+  # ----------------------------------------------------------
+  resolve-artifact:
+    needs: validate-dockerfile
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    outputs:
+      source: ${{ steps.check.outputs.source }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar artefato local e seu tamanho
+        id: check
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+          MAX_SIZE_MB: ${{ inputs.max-size-mb }}
+        run: |
+          if [ -f "$ARTIFACT_PATH" ]; then
+            SIZE_BYTES=$(stat -c%s "$ARTIFACT_PATH")
+            SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+            echo "Artefato encontrado no repo: ${SIZE_MB}MB"
+
+            if [ "$SIZE_MB" -gt "$MAX_SIZE_MB" ]; then
+              echo "::error::Artefato de ${SIZE_MB}MB excede o limite de ${MAX_SIZE_MB}MB para entrega via repositorio. Publique no Nexus."
+              exit 1
+            fi
+
+            echo "source=repo" >> "$GITHUB_OUTPUT"
+          else
+            echo "Artefato nao encontrado no repo, sera buscado no Nexus."
+            echo "source=nexus" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Baixar artefato do Nexus
+        if: steps.check.outputs.source == 'nexus'
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_ARTIFACT_URL: ${{ inputs.nexus-artifact-url }}
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          if [ -z "$NEXUS_ARTIFACT_URL" ]; then
+            echo "::error::Artefato ausente no repo e nenhuma nexus-artifact-url foi informada."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$ARTIFACT_PATH")"
+          curl -sSf -u "$NEXUS_USER:$NEXUS_PASS" -o "$ARTIFACT_PATH" "$NEXUS_ARTIFACT_URL"
+
+      - name: Subir artefato resolvido para os proximos jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-artifact
+          path: ${{ inputs.artifact-path }}
+
+  # ----------------------------------------------------------
+  # JOB 3 - Build da imagem + Scan com Orca + Release
+  # ----------------------------------------------------------
+  build-scan-release:
+    needs: resolve-artifact
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar artefato resolvido (vai para uma pasta temporaria)
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-artifact
+          path: ./resolved-artifact-tmp
+
+      - name: Mover artefato para o path esperado pelo COPY do Dockerfile
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          # O upload-artifact/download-artifact nao garante a mesma estrutura
+          # de pastas do repositorio original, entao recriamos manualmente
+          # o path esperado (ex: artifacts/app.jar) antes do docker build.
+          mkdir -p "$(dirname "$ARTIFACT_PATH")"
+          mv ./resolved-artifact-tmp/* "$ARTIFACT_PATH"
+
+      - name: Build da imagem Docker
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          docker build -t "${IMAGE_NAME}:${{ github.sha }}" .
+
+      - name: Scan de seguranca com Orca
+        env:
+          ORCA_API_TOKEN: ${{ secrets.ORCA_API_TOKEN }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          FAIL_ON: ${{ inputs.orca-fail-on }}
+        run: |
+          # OBS: confirme com o time de seguranca a sintaxe exata do
+          # orca-cli usado na organizacao (pode variar por versao/conta).
+          orca-cli image scan "${IMAGE_NAME}:${{ github.sha }}" \
+            --api-token "$ORCA_API_TOKEN" \
+            --fail-on "$FAIL_ON"
+
+      - name: Exportar imagem como .tar
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          docker save "${IMAGE_NAME}:${{ github.sha }}" -o image.tar
+
+      - name: Publicar release com a imagem
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: image.tar

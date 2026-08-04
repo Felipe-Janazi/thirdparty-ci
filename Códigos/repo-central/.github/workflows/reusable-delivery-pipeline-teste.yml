@@ -1,0 +1,179 @@
+# ============================================================
+# WORKFLOW REUTILIZAVEL - Pipeline de Entrega (VERSAO DE TESTE)
+# ============================================================
+# Variacao reduzida do "reusable-delivery-pipeline.yml", pensada
+# para validar SOMENTE a regra de bloqueio do Dockerfile antes de
+# plugar as partes mais custosas (Orca e publicacao/deploy).
+#
+# O que ESTA presente:
+#   1. Bloqueio de Dockerfile com comando de build (mvn, npm etc)
+#   2. Resolucao do artefato (repo x Nexus), incluindo a regra dos 50MB
+#   3. Build local da imagem Docker (so para confirmar que builda)
+#
+# O que NAO esta presente (de proposito, para essa fase de teste):
+#   - Scan de seguranca com Orca
+#   - Publicacao da imagem (image.tar) como GitHub Release
+#   - Qualquer push/deploy para Nexus ou outro registry
+#
+# Quando a validacao do bloqueio estiver confirmada, basta trocar
+# o "uses:" no caller de "reusable-delivery-pipeline-teste.yml" para
+# "reusable-delivery-pipeline.yml" (a versao completa) para ligar
+# Orca + Release novamente. Nao ha necessidade de reescrever nada
+# no repositorio da aplicacao alem dessa troca.
+# ============================================================
+
+name: Reusable - Delivery Pipeline (Teste de Bloqueio)
+
+on:
+  workflow_call:
+    inputs:
+      artifact-path:
+        description: "Caminho relativo do artefato dentro do repositorio (ex: artifacts/app.jar)"
+        required: false
+        type: string
+        default: "artifacts/app.jar"
+      nexus-artifact-url:
+        description: "URL completa do artefato no Nexus. Usada somente se o artefato nao existir no repo ou exceder o limite de tamanho"
+        required: false
+        type: string
+        default: ""
+      max-size-mb:
+        description: "Tamanho maximo (MB) permitido para o artefato quando entregue via repositorio"
+        required: false
+        type: number
+        default: 50
+      runner-label:
+        description: "Label adicional do runner self-hosted a ser utilizado"
+        required: false
+        type: string
+        default: "sncd-dev"
+      image-name:
+        description: "Nome da imagem Docker gerada (usada so para o build de confirmacao)"
+        required: false
+        type: string
+        default: "app"
+    secrets:
+      NEXUS_USER:
+        required: false
+      NEXUS_PASS:
+        required: false
+
+jobs:
+
+  # ----------------------------------------------------------
+  # JOB 1 - Valida que o Dockerfile NAO contem build de app
+  # (identico ao workflow completo - e o job que estamos testando)
+  # ----------------------------------------------------------
+  validate-dockerfile:
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    steps:
+      - name: Checkout do repositorio que chamou o workflow
+        uses: actions/checkout@v4
+
+      - name: Verificar existencia do Dockerfile
+        run: |
+          if [ ! -f "Dockerfile" ]; then
+            echo "::error::Nenhum Dockerfile encontrado na raiz do repositorio."
+            exit 1
+          fi
+
+      - name: Bloquear Dockerfile com comandos de build de aplicacao
+        run: |
+          PADROES_PROIBIDOS="mvn |maven |npm install|npm ci|npm run build|yarn install|yarn build|gradle |\.\/gradlew|go build|dotnet build|dotnet publish|pip install -e|make build"
+
+          echo "Analisando Dockerfile em busca de comandos de build..."
+
+          if grep -Eiq "$PADROES_PROIBIDOS" Dockerfile; then
+            echo "::error::Voce esta fazendo build de uma aplicacao. Utilize outro fluxo, esse fluxo e somente para entrega de arquivos / imagens de terceiro."
+            exit 1
+          fi
+
+          echo "OK: nenhum comando de build encontrado no Dockerfile."
+
+  # ----------------------------------------------------------
+  # JOB 2 - Resolve a origem do artefato (repo x Nexus)
+  # (mantido para nao mascarar a regra dos 50MB durante o teste)
+  # ----------------------------------------------------------
+  resolve-artifact:
+    needs: validate-dockerfile
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    outputs:
+      source: ${{ steps.check.outputs.source }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verificar artefato local e seu tamanho
+        id: check
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+          MAX_SIZE_MB: ${{ inputs.max-size-mb }}
+        run: |
+          if [ -f "$ARTIFACT_PATH" ]; then
+            SIZE_BYTES=$(stat -c%s "$ARTIFACT_PATH")
+            SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+            echo "Artefato encontrado no repo: ${SIZE_MB}MB"
+
+            if [ "$SIZE_MB" -gt "$MAX_SIZE_MB" ]; then
+              echo "::error::Artefato de ${SIZE_MB}MB excede o limite de ${MAX_SIZE_MB}MB para entrega via repositorio. Publique no Nexus."
+              exit 1
+            fi
+
+            echo "source=repo" >> "$GITHUB_OUTPUT"
+          else
+            echo "Artefato nao encontrado no repo, sera buscado no Nexus."
+            echo "source=nexus" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Baixar artefato do Nexus
+        if: steps.check.outputs.source == 'nexus'
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+          NEXUS_ARTIFACT_URL: ${{ inputs.nexus-artifact-url }}
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          if [ -z "$NEXUS_ARTIFACT_URL" ]; then
+            echo "::error::Artefato ausente no repo e nenhuma nexus-artifact-url foi informada."
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$ARTIFACT_PATH")"
+          curl -sSf -u "$NEXUS_USER:$NEXUS_PASS" -o "$ARTIFACT_PATH" "$NEXUS_ARTIFACT_URL"
+
+      - name: Subir artefato resolvido para o proximo job
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-artifact
+          path: ${{ inputs.artifact-path }}
+
+  # ----------------------------------------------------------
+  # JOB 3 - Build LOCAL de confirmacao (sem Orca, sem publicacao)
+  # ----------------------------------------------------------
+  build-only:
+    needs: resolve-artifact
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar artefato resolvido (pasta temporaria)
+        uses: actions/download-artifact@v4
+        with:
+          name: resolved-artifact
+          path: ./resolved-artifact-tmp
+
+      - name: Mover artefato para o path esperado pelo COPY do Dockerfile
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          mkdir -p "$(dirname "$ARTIFACT_PATH")"
+          mv ./resolved-artifact-tmp/* "$ARTIFACT_PATH"
+
+      - name: Build da imagem Docker (somente para confirmar que builda)
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          docker build -t "${IMAGE_NAME}:${{ github.sha }}" .
+          echo "Build concluido com sucesso. Nenhum scan ou publicacao foi executado nesta versao de teste."
+
+      # Sem Orca, sem docker save, sem release, sem push para Nexus/registry.
+      # Isso e adicionado de volta somente na versao completa do workflow.
